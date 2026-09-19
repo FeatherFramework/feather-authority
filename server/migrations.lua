@@ -218,6 +218,16 @@ local definitions = {
                 PRIMARY KEY (`source_resource`,`request_id`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin]]
         }
+    },
+    {
+        id = '010_character_assignments',
+        statements = {
+            [[ALTER TABLE `feather_authority_assignments`
+                DROP CONSTRAINT `chk_authority_assignment_subject`]],
+            [[ALTER TABLE `feather_authority_assignments`
+                ADD CONSTRAINT `chk_authority_assignment_subject`
+                CHECK (`subject_type` IN ('account','character'))]]
+        }
     }
 }
 

@@ -22,4 +22,4 @@ server_scripts {
     'server/main.lua'
 }
 
-dependencies { 'oxmysql', 'feather-core', 'feather-organizations' }
+dependencies { 'oxmysql', 'feather-core', 'feather-character', 'feather-organizations' }

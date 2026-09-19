@@ -6,7 +6,7 @@ Core remains the authenticated policy-evaluation boundary, while every domain
 continues to authorize its own protected mutations.
 
 Contract 1 provides lifecycle/readiness, checksum-protected migrations, a bounded
-capability registry, durable roles and grants, account assignments and lifecycle,
+capability registry, durable roles and grants, account and character assignments and lifecycle,
 effective-capability evaluation, transactional service-owned staff assignment
 replacement, and a named non-default Core policy provider.
 

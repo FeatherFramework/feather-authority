@@ -96,8 +96,10 @@ RegisterCommand('AuthorityReleaseContractSmokeTest', function(source)
         { 'named provider available', provider.ok and provider.value.provider.owner == 'feather-authority' },
         { 'production capabilities', capabilities.ok and capabilities.value.contract == 1
             and capabilities.value.features.assignmentReplacement == 1
+            and capabilities.value.features.assignmentReads == 1
+            and capabilities.value.features.characterAssignments == 1
             and capabilities.value.features.effectiveCapabilityReads == 1 },
-        { 'migration ledger complete', migrations == 9 }
+        { 'migration ledger complete', migrations == 10 }
     }
     local passed = 0
     for _, test in ipairs(tests) do
@@ -147,7 +149,7 @@ Authority.RegisterDevCommand('AuthorityFoundationSmokeTest', function(source)
             { 'await ready', Authority.AwaitReady(0).ok },
             { 'persisted identity', staff.ok and persisted
                 and persisted.capability_id == staff.value.capabilityId },
-            { 'migration ledger', tonumber(migrations) == 9 }
+            { 'migration ledger', tonumber(migrations) == 10 }
         }
         local passed = 0
         for _, test in ipairs(tests) do
