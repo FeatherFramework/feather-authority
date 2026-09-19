@@ -51,6 +51,64 @@ AddEventHandler('onResourceStop', function(resource)
     end
 end)
 
+RegisterCommand('AuthorityReleaseContractSmokeTest', function(source)
+    if source ~= 0 then return end
+    local registered, callable = {}, type(GetRegisteredCommands) == 'function'
+    if callable then
+        for _, command in ipairs(GetRegisteredCommands() or {}) do
+            local name = type(command) == 'table' and command.name or nil
+            if type(name) == 'string' then registered[name] = true end
+        end
+    end
+    local developmentAbsent = callable
+    if callable then
+        for name in pairs(registered) do
+            if name ~= 'AuthorityReleaseContractSmokeTest' and name:sub(1, 9) == 'Authority' then
+                developmentAbsent = false
+                break
+            end
+        end
+    end
+    local health = Authority.GetHealth()
+    local capabilities = Authority.GetCapabilities()
+    local provider = exports['feather-core']:GetProvider('policy', 'feather-authority', 1)
+    local access = Config.Access or {}
+    local adminTrusted = access.trustedReaders and access.trustedReaders['feather-admin'] == true
+        and access.trustedCapabilityRegistrars
+            and access.trustedCapabilityRegistrars['feather-admin'] == true
+        and access.trustedRoleCreators and access.trustedRoleCreators['feather-admin'] == true
+        and access.trustedGrantors and access.trustedGrantors['feather-admin'] == true
+        and access.trustedAssigners and access.trustedAssigners['feather-admin'] == true
+    local fixture = 'feather-authority-tests'
+    local fixtureAbsent = access.trustedReaders[fixture] ~= true
+        and access.trustedCapabilityRegistrars[fixture] ~= true
+        and access.trustedRoleCreators[fixture] ~= true
+        and access.trustedGrantors[fixture] ~= true
+        and access.trustedAssigners[fixture] ~= true
+    local migrations = tonumber(MySQL.scalar.await(
+        'SELECT COUNT(*) FROM `feather_authority_schema_migrations`'))
+    local tests = {
+        { 'service ready', health.ok and health.value.state == 'ready' },
+        { 'server development disabled', Config.DevMode == false },
+        { 'development commands absent', developmentAbsent },
+        { 'fixture trust absent', fixtureAbsent },
+        { 'Admin trust complete', adminTrusted },
+        { 'named provider available', provider.ok and provider.value.provider.owner == 'feather-authority' },
+        { 'production capabilities', capabilities.ok and capabilities.value.contract == 1
+            and capabilities.value.features.assignmentReplacement == 1
+            and capabilities.value.features.effectiveCapabilityReads == 1 },
+        { 'migration ledger complete', migrations == 9 }
+    }
+    local passed = 0
+    for _, test in ipairs(tests) do
+        if test[2] then passed = passed + 1 end
+        print(('[AuthorityReleaseContractSmokeTest] %-29s %s'):format(
+            test[1], test[2] and 'PASS' or 'FAIL'))
+    end
+    print(('[AuthorityReleaseContractSmokeTest] done %d/%d passed (read-only)'):format(
+        passed, #tests))
+end, true)
+
 Authority.RegisterDevCommand('AuthorityFoundationSmokeTest', function(source)
     if source ~= 0 then return end
     local called, reason = xpcall(function()

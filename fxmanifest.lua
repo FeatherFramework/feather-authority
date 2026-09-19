@@ -6,7 +6,7 @@ lua54 'yes'
 name 'feather-authority'
 author 'Feather Framework'
 description 'Durable capability and assignment authority for the Feather Framework'
-version '0.1.0'
+version '0.2.0'
 
 server_scripts {
     '@oxmysql/lib/MySQL.lua',
