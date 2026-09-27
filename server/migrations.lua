@@ -229,7 +229,7 @@ local function Hash(value)
 end
 
 function AuthorityMigrations.Run()
-    MySQL.query.await([[CREATE TABLE IF NOT EXISTS `feather_authority_schema_migrations` (
+    DB.exec([[CREATE TABLE IF NOT EXISTS `feather_authority_schema_migrations` (
         `id` VARCHAR(100) NOT NULL,
         `checksum` VARCHAR(64) NOT NULL,
         `applied_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -238,18 +238,18 @@ function AuthorityMigrations.Run()
     local count = 0
     for _, migration in ipairs(definitions) do
         local checksum = Hash(table.concat(migration.statements, '\n-- next statement --\n'))
-        local applied = MySQL.single.await(
-            'SELECT `checksum` FROM `feather_authority_schema_migrations` WHERE `id`=?', { migration.id })
+        local applied = DB.one(
+            'SELECT `checksum` FROM `feather_authority_schema_migrations` WHERE `id`=?', migration.id)
         if applied and applied.checksum ~= checksum then
             return Authority.Err('migration_checksum_mismatch', 'An applied Authority migration changed.', {
                 migrationId = migration.id
             })
         end
         if not applied then
-            for _, statement in ipairs(migration.statements) do MySQL.query.await(statement) end
-            MySQL.insert.await(
+            for _, statement in ipairs(migration.statements) do DB.raw(statement) end
+            DB.insert(
                 'INSERT INTO `feather_authority_schema_migrations` (`id`,`checksum`) VALUES (?,?)',
-                { migration.id, checksum })
+                migration.id, checksum)
             count = count + 1
         end
     end

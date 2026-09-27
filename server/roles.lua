@@ -66,9 +66,9 @@ function AuthorityRoles.Get(request, resource)
     for field in pairs(request) do
         if field ~= 'roleId' then return Err('invalid_input', 'Unexpected role read field.') end
     end
-    return Snapshot(MySQL.single.await('SELECT * FROM `feather_authority_roles` WHERE `role_id`=?', {
+    return Snapshot(DB.one('SELECT * FROM `feather_authority_roles` WHERE `role_id`=?',
         request.roleId:lower()
-    }))
+    ))
 end
 
 function AuthorityRoles.Find(request, resource)
@@ -80,9 +80,9 @@ function AuthorityRoles.Find(request, resource)
     for field in pairs(request) do
         if field ~= 'roleKey' then return Err('invalid_input', 'Unexpected role lookup field.') end
     end
-    return Snapshot(MySQL.single.await('SELECT * FROM `feather_authority_roles` WHERE `role_key`=?', {
+    return Snapshot(DB.one('SELECT * FROM `feather_authority_roles` WHERE `role_key`=?',
         request.roleKey
-    }))
+    ))
 end
 
 function AuthorityRoles.Create(request, resource)
@@ -95,16 +95,14 @@ function AuthorityRoles.Create(request, resource)
     if not valid.ok then return valid end
     request = Authority.Copy(request)
     local result
-    local called, committed = pcall(MySQL.startTransaction, function(query)
+    local called, committed = pcall(DB.transaction, function(tx)
         local executed, outcome = xpcall(function()
-            query([[INSERT IGNORE INTO `feather_authority_role_creation_receipts`
+            tx.exec([[INSERT IGNORE INTO `feather_authority_role_creation_receipts`
                 (`source_resource`,`request_id`,`request_fingerprint`) VALUES (?,?,?)]],
-                { resource, request.requestId, valid.value })
-            local receipts = query([[SELECT `request_fingerprint`,`result_json`
+                resource, request.requestId, valid.value)
+            local receipts = tx.query([[SELECT `request_fingerprint`,`result_json`
                 FROM `feather_authority_role_creation_receipts`
-                WHERE `source_resource`=? AND `request_id`=? FOR UPDATE]], {
-                resource, request.requestId
-            }) or {}
+                WHERE `source_resource`=? AND `request_id`=? FOR UPDATE]], resource, request.requestId) or {}
             local receipt = receipts[1]
             if not receipt then return Err('internal_error', 'Role creation receipt could not be reserved.') end
             if receipt.request_fingerprint ~= valid.value then
@@ -120,34 +118,26 @@ function AuthorityRoles.Create(request, resource)
                 value.replayed = true
                 return Ok(value)
             end
-            local ids = query('SELECT UUID() AS `role_id`,UUID() AS `event_id`') or {}
+            local ids = tx.query('SELECT UUID() AS `role_id`,UUID() AS `event_id`') or {}
             local id, eventId = ids[1] and ids[1].role_id, ids[1] and ids[1].event_id
             if not Authority.Uuid(id) or not Authority.Uuid(eventId) then
                 return Err('internal_error', 'Could not generate Authority role identities.')
             end
-            query([[INSERT IGNORE INTO `feather_authority_roles`
-                (`role_id`,`role_key`,`label`,`role_class`,`owner_resource`) VALUES (?,?,?,?,?)]], {
-                id, request.roleKey, request.label, request.roleClass, resource
-            })
-            local rows = query('SELECT * FROM `feather_authority_roles` WHERE `role_key`=? FOR UPDATE', {
-                request.roleKey
-            }) or {}
+            tx.exec([[INSERT IGNORE INTO `feather_authority_roles`
+                (`role_id`,`role_key`,`label`,`role_class`,`owner_resource`) VALUES (?,?,?,?,?)]], id, request.roleKey, request.label, request.roleClass, resource)
+            local rows = tx.query('SELECT * FROM `feather_authority_roles` WHERE `role_key`=? FOR UPDATE', request.roleKey) or {}
             if not rows[1] or rows[1].role_id ~= id then
                 return Err('role_key_conflict', 'Role key is already reserved.')
             end
             local created = Snapshot(rows[1])
             if not created.ok then return created end
             created.value.replayed = false
-            query([[INSERT INTO `feather_authority_role_events`
+            tx.exec([[INSERT INTO `feather_authority_role_events`
                 (`event_id`,`role_id`,`event_type`,`source_resource`,`request_id`,`reason_code`,`revision`)
-                VALUES (?,?,'authority.role.created',?,?,?,1)]], {
-                eventId, id, resource, request.requestId, request.reasonCode
-            })
-            query([[UPDATE `feather_authority_role_creation_receipts` SET `result_json`=?
-                WHERE `source_resource`=? AND `request_id`=?]], {
-                json.encode(created.value), resource, request.requestId
-            })
-            query('UPDATE `feather_authority_policy_state` SET `policy_version`=`policy_version`+1 WHERE `id`=1')
+                VALUES (?,?,'authority.role.created',?,?,?,1)]], eventId, id, resource, request.requestId, request.reasonCode)
+            tx.exec([[UPDATE `feather_authority_role_creation_receipts` SET `result_json`=?
+                WHERE `source_resource`=? AND `request_id`=?]], json.encode(created.value), resource, request.requestId)
+            tx.exec('UPDATE `feather_authority_policy_state` SET `policy_version`=`policy_version`+1 WHERE `id`=1')
             return created
         end, debug.traceback)
         if not executed then

@@ -6,10 +6,10 @@ lua54 'yes'
 name 'feather-authority'
 author 'Feather Framework'
 description 'Durable capability and assignment authority for the Feather Framework'
-version '0.3.0'
+version '0.4.0'
 
 server_scripts {
-    '@oxmysql/lib/MySQL.lua',
+    '@feather-mysql/lib/DB.lua',
     'config.lua',
     'server/foundation.lua',
     'server/migrations.lua',
@@ -22,4 +22,4 @@ server_scripts {
     'server/main.lua'
 }
 
-dependencies { 'oxmysql', 'feather-core', 'feather-character', 'feather-organizations' }
+dependencies { 'feather-mysql', 'feather-core', 'feather-character', 'feather-organizations' }

@@ -56,15 +56,15 @@ function AuthorityCapabilities.Register(request, resource)
     request = Authority.Copy(request)
     table.sort(request.capabilities, function(left, right) return left.key < right.key end)
     local result
-    local called, committed = pcall(MySQL.startTransaction, function(query)
+    local called, committed = pcall(DB.transaction, function(tx)
         local executed, outcome = xpcall(function()
-            query([[INSERT IGNORE INTO `feather_authority_capability_registration_receipts`
+            tx.exec([[INSERT IGNORE INTO `feather_authority_capability_registration_receipts`
                 (`source_resource`,`request_id`,`request_fingerprint`) VALUES (?,?,?)]],
-                { resource, request.requestId, valid.value })
-            local receipts = query([[SELECT `request_fingerprint`,`result_json` FROM
+                resource, request.requestId, valid.value)
+            local receipts = tx.query([[SELECT `request_fingerprint`,`result_json` FROM
                 `feather_authority_capability_registration_receipts`
                 WHERE `source_resource`=? AND `request_id`=? FOR UPDATE]],
-                { resource, request.requestId }) or {}
+                resource, request.requestId) or {}
             local receipt = receipts[1]
             if not receipt then return Authority.Err('internal_error', 'Registration receipt could not be reserved.') end
             if receipt.request_fingerprint ~= valid.value then
@@ -79,53 +79,87 @@ function AuthorityCapabilities.Register(request, resource)
                 value.replayed = true
                 return Authority.Ok(value)
             end
-            local total = tonumber((query('SELECT COUNT(*) AS `count` FROM `feather_authority_capabilities`') or {})[1].count)
-            local registered, updated, unchanged, identities = 0, 0, 0, {}
+            local total = tonumber((tx.query('SELECT COUNT(*) AS `count` FROM `feather_authority_capabilities`') or {})[1].count)
+            local keys, placeholders = {}, {}
             for _, definition in ipairs(request.capabilities) do
-                local rows = query([[SELECT * FROM `feather_authority_capabilities`
-                    WHERE `capability_key`=? FOR UPDATE]], { definition.key }) or {}
-                local row = rows[1]
+                keys[#keys + 1] = definition.key
+                placeholders[#placeholders + 1] = '?'
+            end
+            local selection = [[SELECT * FROM `feather_authority_capabilities`
+                WHERE `capability_key` IN (]] .. table.concat(placeholders, ',')
+                .. ') ORDER BY `capability_key` FOR UPDATE'
+            local existing = {}
+            for _, row in ipairs(tx.query(selection, table.unpack(keys)) or {}) do
+                existing[row.capability_key] = row
+            end
+            local registered, updated, unchanged, identities = 0, 0, 0, {}
+            local inserts, insertParams, changes, events = {}, {}, {}, {}
+            for _, definition in ipairs(request.capabilities) do
+                local row = existing[definition.key]
                 if row and row.owner_resource ~= resource then
                     return Authority.Err('capability_owner_conflict',
                         'Capability belongs to another resource.', { capabilityKey = definition.key })
                 end
                 local changed = row and (row.description ~= definition.description
                     or row.risk_class ~= definition.riskClass)
-                local capabilityId = row and row.capability_id or nil
                 if not row then
                     if total + registered >= 128 then
                         return Authority.Err('capability_catalog_limit', 'Capability catalog limit would be exceeded.')
                     end
-                    local ids = query('SELECT UUID() AS `capability_id`') or {}
-                    capabilityId = ids[1] and ids[1].capability_id
-                    query([[INSERT INTO `feather_authority_capabilities`
-                        (`capability_id`,`capability_key`,`description`,`risk_class`,`owner_resource`)
-                        VALUES (?,?,?,?,?)]], { capabilityId, definition.key, definition.description,
-                        definition.riskClass, resource })
+                    inserts[#inserts + 1] = '(UUID(),?,?,?,?)'
+                    insertParams[#insertParams + 1] = definition.key
+                    insertParams[#insertParams + 1] = definition.description
+                    insertParams[#insertParams + 1] = definition.riskClass
+                    insertParams[#insertParams + 1] = resource
                     registered = registered + 1
                 elseif changed then
-                    query([[UPDATE `feather_authority_capabilities` SET `description`=?,`risk_class`=?,
-                        `revision`=`revision`+1 WHERE `capability_id`=?]],
-                        { definition.description, definition.riskClass, capabilityId })
+                    changes[#changes + 1] = definition
                     updated = updated + 1
                 else unchanged = unchanged + 1 end
-                identities[#identities + 1] = { key = definition.key, capabilityId = capabilityId }
                 if not row or changed then
-                    local event = (query('SELECT UUID() AS `event_id`') or {})[1]
-                    query([[INSERT INTO `feather_authority_capability_events`
-                        (`event_id`,`capability_id`,`event_type`,`source_resource`,`request_id`)
-                        VALUES (?,?,?, ?,?)]], { event.event_id, capabilityId,
-                        row and 'authority.capability.updated' or 'authority.capability.registered',
-                        resource, request.requestId })
+                    events[definition.key] = row and 'authority.capability.updated'
+                        or 'authority.capability.registered'
                 end
+            end
+            -- Keep large startup catalogs within the transaction deadline by grouping
+            -- inserts, identity reads, and events on this same transaction connection.
+            if #inserts > 0 then
+                tx.exec([[INSERT INTO `feather_authority_capabilities`
+                    (`capability_id`,`capability_key`,`description`,`risk_class`,`owner_resource`)
+                    VALUES ]] .. table.concat(inserts, ','), table.unpack(insertParams))
+                for _, row in ipairs(tx.query(selection, table.unpack(keys)) or {}) do
+                    existing[row.capability_key] = row
+                end
+            end
+            for _, definition in ipairs(changes) do
+                tx.exec([[UPDATE `feather_authority_capabilities` SET `description`=?,`risk_class`=?,
+                    `revision`=`revision`+1 WHERE `capability_id`=?]],
+                    definition.description, definition.riskClass, existing[definition.key].capability_id)
+            end
+            local eventValues, eventParams = {}, {}
+            for _, definition in ipairs(request.capabilities) do
+                local capabilityId = existing[definition.key].capability_id
+                identities[#identities + 1] = { key = definition.key, capabilityId = capabilityId }
+                if events[definition.key] then
+                    eventValues[#eventValues + 1] = '(UUID(),?,?,?,?)'
+                    eventParams[#eventParams + 1] = capabilityId
+                    eventParams[#eventParams + 1] = events[definition.key]
+                    eventParams[#eventParams + 1] = resource
+                    eventParams[#eventParams + 1] = request.requestId
+                end
+            end
+            if #eventValues > 0 then
+                tx.exec([[INSERT INTO `feather_authority_capability_events`
+                    (`event_id`,`capability_id`,`event_type`,`source_resource`,`request_id`)
+                    VALUES ]] .. table.concat(eventValues, ','), table.unpack(eventParams))
             end
             local value = { registered = registered, updated = updated, unchanged = unchanged,
                 capabilities = identities, replayed = false }
-            query([[UPDATE `feather_authority_capability_registration_receipts` SET `result_json`=?
+            tx.exec([[UPDATE `feather_authority_capability_registration_receipts` SET `result_json`=?
                 WHERE `source_resource`=? AND `request_id`=?]],
-                { json.encode(value), resource, request.requestId })
+                json.encode(value), resource, request.requestId)
             if registered + updated > 0 then
-                query('UPDATE `feather_authority_policy_state` SET `policy_version`=`policy_version`+1 WHERE `id`=1')
+                tx.exec('UPDATE `feather_authority_policy_state` SET `policy_version`=`policy_version`+1 WHERE `id`=1')
             end
             return Authority.Ok(value)
         end, debug.traceback)
@@ -145,25 +179,25 @@ end
 
 function AuthorityCapabilities.Load()
     for _, definition in ipairs(Config.Capabilities) do
-        local existing = MySQL.single.await(
+        local existing = DB.one(
             'SELECT `owner_resource` FROM `feather_authority_capabilities` WHERE `capability_key`=?',
-            { definition.key })
+            definition.key)
         if existing and existing.owner_resource ~= GetCurrentResourceName() then
             return Authority.Err('capability_owner_conflict', 'Configured capability belongs to another resource.', {
                 capabilityKey = definition.key
             })
         end
-        MySQL.query.await([[INSERT INTO `feather_authority_capabilities`
+        DB.exec([[INSERT INTO `feather_authority_capabilities`
             (`capability_id`,`capability_key`,`description`,`risk_class`,`owner_resource`)
             VALUES (UUID(),?,?,?,?) ON DUPLICATE KEY UPDATE
                 `revision`=`revision` + IF(`description`<>VALUES(`description`)
                     OR `risk_class`<>VALUES(`risk_class`),1,0),
                 `description`=VALUES(`description`),
-                `risk_class`=VALUES(`risk_class`)]], {
+                `risk_class`=VALUES(`risk_class`)]],
             definition.key, definition.description, definition.riskClass, GetCurrentResourceName()
-        })
+        )
     end
-    local rows = MySQL.query.await([[SELECT `capability_id`,`capability_key`,`description`,
+    local rows = DB.query([[SELECT `capability_id`,`capability_key`,`description`,
         `risk_class`,`owner_resource`,`status`,`revision`
         FROM `feather_authority_capabilities` ORDER BY `capability_key` LIMIT 129]]) or {}
     if #rows > 128 then

@@ -31,17 +31,17 @@ function AuthorityEvaluation.Evaluate(request, resource)
     if not allowed.ok then return allowed end
     local valid = AuthorityEvaluation.Validate(request)
     if not valid.ok then return valid end
-    local policyVersion = tonumber(MySQL.scalar.await(
+    local policyVersion = tonumber(DB.value(
         'SELECT `policy_version` FROM `feather_authority_policy_state` WHERE `id`=1'))
     if not Authority.Integer(policyVersion, 1, 9007199254740991) then
         return Err('invalid_persistence', 'Authority policy version is invalid.')
     end
-    local capability = MySQL.single.await([[SELECT `capability_id`,`status` FROM
-        `feather_authority_capabilities` WHERE `capability_key`=?]], { request.capabilityKey })
+    local capability = DB.one([[SELECT `capability_id`,`status` FROM
+        `feather_authority_capabilities` WHERE `capability_key`=?]], request.capabilityKey)
     if not capability or capability.status ~= 'active' then
         return Decision(false, 'capability_unavailable', policyVersion)
     end
-    local row = MySQL.single.await([[SELECT a.`assignment_id`,a.`role_id`,g.`grant_id`
+    local row = DB.one([[SELECT a.`assignment_id`,a.`role_id`,g.`grant_id`
         FROM `feather_authority_assignments` a
         JOIN `feather_authority_roles` r ON r.`role_id`=a.`role_id` AND r.`status`='active'
         JOIN `feather_authority_role_grants` g ON g.`role_id`=r.`role_id`
@@ -49,8 +49,7 @@ function AuthorityEvaluation.Evaluate(request, resource)
             AND g.`status`='active'
         WHERE a.`subject_type`=? AND a.`subject_id`=? AND a.`scope_type`='server'
             AND a.`status`='active' AND (a.`valid_until` IS NULL OR a.`valid_until`>CURRENT_TIMESTAMP)
-        ORDER BY a.`assignment_id` LIMIT 1]], {
-            capability.capability_id, request.subjectType, request.subjectId:lower() })
+        ORDER BY a.`assignment_id` LIMIT 1]], capability.capability_id, request.subjectType, request.subjectId:lower())
     if not row then return Decision(false, 'no_active_assignment', policyVersion) end
     return Decision(true, 'explicit_role_grant', policyVersion,
         row.assignment_id, row.role_id, row.grant_id)
@@ -69,12 +68,12 @@ function AuthorityEvaluation.ListEffective(request, resource)
             return Err('invalid_input', 'Unexpected effective-capability field.')
         end
     end
-    local policyVersion = tonumber(MySQL.scalar.await(
+    local policyVersion = tonumber(DB.value(
         'SELECT `policy_version` FROM `feather_authority_policy_state` WHERE `id`=1'))
     if not Authority.Integer(policyVersion, 1, 9007199254740991) then
         return Err('invalid_persistence', 'Authority policy version is invalid.')
     end
-    local rows = MySQL.query.await([[SELECT DISTINCT c.`capability_key`
+    local rows = DB.query([[SELECT DISTINCT c.`capability_key`
         FROM `feather_authority_assignments` a
         JOIN `feather_authority_roles` r ON r.`role_id`=a.`role_id` AND r.`status`='active'
         JOIN `feather_authority_role_grants` g ON g.`role_id`=r.`role_id`
@@ -83,7 +82,7 @@ function AuthorityEvaluation.ListEffective(request, resource)
             AND c.`status`='active'
         WHERE a.`subject_type`=? AND a.`subject_id`=? AND a.`scope_type`='server'
             AND a.`status`='active' AND (a.`valid_until` IS NULL OR a.`valid_until`>CURRENT_TIMESTAMP)
-        ORDER BY c.`capability_key` LIMIT 129]], { request.subjectType, request.subjectId:lower() }) or {}
+        ORDER BY c.`capability_key` LIMIT 129]], request.subjectType, request.subjectId:lower()) or {}
     if #rows > 128 then return Err('capability_catalog_limit', 'Effective capability result exceeds 128.') end
     local capabilities = {}
     for _, row in ipairs(rows) do

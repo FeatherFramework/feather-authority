@@ -3,6 +3,9 @@ CreateThread(function()
         local valid = Authority.ValidateConfig()
         if not valid.ok then return valid end
         Authority.SetState('waiting', 'waiting_for_dependencies')
+        if not DB.awaitReady(Config.ReadinessTimeoutMs) then
+            return Authority.Err('dependency_unavailable', 'Database did not become ready.')
+        end
         local core = exports['feather-core']:AwaitReady(Config.ReadinessTimeoutMs)
         if type(core) ~= 'table' or not core.ok then
             return Authority.Err('dependency_unavailable', 'Core did not become ready.')
@@ -43,7 +46,7 @@ CreateThread(function()
 end)
 
 AddEventHandler('onResourceStop', function(resource)
-    if resource == 'feather-core' or resource == 'feather-organizations' or resource == 'oxmysql' then
+    if resource == 'feather-core' or resource == 'feather-organizations' or resource == 'feather-mysql' then
         Authority.Fail(Authority.Err('dependency_unavailable',
             'A required dependency stopped. Restart Authority after it is ready.'))
     elseif resource == GetCurrentResourceName() then
@@ -85,7 +88,7 @@ RegisterCommand('AuthorityReleaseContractSmokeTest', function(source)
         and access.trustedRoleCreators[fixture] ~= true
         and access.trustedGrantors[fixture] ~= true
         and access.trustedAssigners[fixture] ~= true
-    local migrations = tonumber(MySQL.scalar.await(
+    local migrations = tonumber(DB.value(
         'SELECT COUNT(*) FROM `feather_authority_schema_migrations`'))
     local tests = {
         { 'service ready', health.ok and health.value.state == 'ready' },
@@ -126,9 +129,9 @@ Authority.RegisterDevCommand('AuthorityFoundationSmokeTest', function(source)
         local denied = AuthorityCapabilities.List('untrusted-smoke-caller')
         local unknown = AuthorityCapabilities.Get('staff.unknown.test', owner)
         local invalid = AuthorityCapabilities.Get({}, owner)
-        local persisted = MySQL.single.await([[SELECT `capability_id` FROM
-            `feather_authority_capabilities` WHERE `capability_key`=?]], { 'staff.authority.manage' })
-        local migrations = MySQL.scalar.await('SELECT COUNT(*) FROM `feather_authority_schema_migrations`')
+        local persisted = DB.one([[SELECT `capability_id` FROM
+            `feather_authority_capabilities` WHERE `capability_key`=?]], 'staff.authority.manage')
+        local migrations = DB.value('SELECT COUNT(*) FROM `feather_authority_schema_migrations`')
         local function Valid(result, key, namespace)
             return result.ok and result.value.key == key and Authority.Uuid(result.value.capabilityId)
                 and result.value.status == 'active' and result.value.revision >= 1
@@ -430,10 +433,10 @@ Authority.RegisterDevCommand('AuthorityAssignmentLiveTest', function(source, arg
         assert(read.ok and read.value.subjectType == 'character'
             and read.value.subjectId == session.value.characterId
             and read.value.issuerId == GetCurrentResourceName(), 'Assignment attribution is invalid')
-        local assignmentCount = tonumber(MySQL.scalar.await([[SELECT COUNT(*) FROM
-            `feather_authority_assignments` WHERE `assignment_id`=?]], { first.value.assignmentId }))
-        local eventCount = tonumber(MySQL.scalar.await([[SELECT COUNT(*) FROM
-            `feather_authority_assignment_events` WHERE `assignment_id`=?]], { first.value.assignmentId }))
+        local assignmentCount = tonumber(DB.value([[SELECT COUNT(*) FROM
+            `feather_authority_assignments` WHERE `assignment_id`=?]], first.value.assignmentId))
+        local eventCount = tonumber(DB.value([[SELECT COUNT(*) FROM
+            `feather_authority_assignment_events` WHERE `assignment_id`=?]], first.value.assignmentId))
         assert(assignmentCount == 1 and eventCount == 1,
             'Assignment did not produce exactly one identity and audit event')
         print(('[AuthorityAssignmentLiveTest] PASS assignment=%s character=%s role=%s firstReplayed=%s replayed=true mismatchRejected=true staleRejected=true attribution=true singleAssignmentAudit=true'):format(
@@ -460,9 +463,9 @@ Authority.RegisterDevCommand('AuthorityAssignmentOfflineReplayTest', function(so
         local identity = exports['feather-core']:GetAccountIdentity(args[1])
         local read = AuthorityAssignments.Get({ assignmentId = replay.value.assignmentId },
             GetCurrentResourceName())
-        local events = tonumber(MySQL.scalar.await([[SELECT COUNT(*) FROM
+        local events = tonumber(DB.value([[SELECT COUNT(*) FROM
             `feather_authority_assignment_events` WHERE `assignment_id`=?]],
-            { replay.value.assignmentId }))
+            replay.value.assignmentId))
         assert(identity.ok and read.ok and read.value.subjectId == identity.value.accountId
             and events == 1, 'Offline assignment identity or audit evidence changed')
         print(('[AuthorityAssignmentOfflineReplayTest] PASS assignment=%s account=%s role=%s replayed=true activeSessionNotRequired=true singleAssignmentAudit=true'):format(
@@ -609,8 +612,8 @@ Authority.RegisterDevCommand('AuthorityAssignmentLifecycleLiveTest', function(so
         assert(not terminal.ok and terminal.code == 'assignment_terminal', 'Revoked assignment was resumed')
         local final = AuthorityAssignments.Get({ assignmentId = args[1] }, GetCurrentResourceName())
         local finalDecision = Evaluate()
-        local events = tonumber(MySQL.scalar.await([[SELECT COUNT(*) FROM
-            `feather_authority_assignment_events` WHERE `assignment_id`=?]], { args[1] }))
+        local events = tonumber(DB.value([[SELECT COUNT(*) FROM
+            `feather_authority_assignment_events` WHERE `assignment_id`=?]], args[1]))
         assert(final.ok and final.value.status == 'revoked' and final.value.revision == 4 and events == 4
             and finalDecision.ok and finalDecision.value.allowed == false,
             'Final assignment lifecycle evidence is inconsistent')
@@ -628,15 +631,15 @@ Authority.RegisterDevCommand('AuthorityAssignmentExpiryTest', function(source, a
             'Use <account UUID> <role UUID> <stable requestId>')
         local role = AuthorityRoles.Get({ roleId = args[2] }, GetCurrentResourceName())
         assert(role.ok, tostring(role.code) .. ': ' .. tostring(role.message))
-        local receipt = MySQL.single.await([[SELECT `result_json` FROM `feather_authority_assignment_receipts`
-            WHERE `source_resource`=? AND `request_id`=?]], { GetCurrentResourceName(), args[3] })
+        local receipt = DB.one([[SELECT `result_json` FROM `feather_authority_assignment_receipts`
+            WHERE `source_resource`=? AND `request_id`=?]], GetCurrentResourceName(), args[3])
         local priorId
         if receipt and receipt.result_json then
             local decoded, value = pcall(json.decode, receipt.result_json)
             if decoded and type(value) == 'table' then priorId = value.assignmentId end
         end
-        local validUntil = priorId and tonumber(MySQL.scalar.await([[SELECT UNIX_TIMESTAMP(`valid_until`)
-            FROM `feather_authority_assignments` WHERE `assignment_id`=?]], { priorId })) or os.time() + 3
+        local validUntil = priorId and tonumber(DB.value([[SELECT UNIX_TIMESTAMP(`valid_until`)
+            FROM `feather_authority_assignments` WHERE `assignment_id`=?]], priorId)) or os.time() + 3
         local request = { requestId = args[3], subjectType = 'account', subjectId = args[1],
             roleId = args[2], expectedRoleRevision = role.value.revision, scopeType = 'server',
             validUntil = validUntil, reason = 'Authority expiry acceptance',
@@ -677,10 +680,10 @@ Authority.RegisterDevCommand('AuthorityAssignmentConcurrencyTest', function(sour
             GetCurrentResourceName())
         assert(issued.ok, tostring(issued.code) .. ': ' .. tostring(issued.message))
         local assignmentId = issued.value.assignmentId
-        local prior = MySQL.query.await([[SELECT `request_id`,`event_type` FROM
+        local prior = DB.query([[SELECT `request_id`,`event_type` FROM
             `feather_authority_assignment_events` WHERE `assignment_id`=?
                 AND `request_id` IN (?,?)]],
-            { assignmentId, args[3] .. ':suspend', args[3] .. ':revoke' }) or {}
+            assignmentId, args[3] .. ':suspend', args[3] .. ':revoke') or {}
         local winner, loser
         if #prior == 0 then
             print('[AuthorityAssignmentConcurrencyTest] started assignment=' .. assignmentId)
@@ -727,9 +730,9 @@ Authority.RegisterDevCommand('AuthorityAssignmentConcurrencyTest', function(sour
         local final = AuthorityAssignments.Get({ assignmentId = assignmentId }, GetCurrentResourceName())
         local decision = AuthorityEvaluation.Evaluate({ subjectType = 'account', subjectId = args[1],
             capabilityKey = 'staff.players.view', scopeType = 'server' }, GetCurrentResourceName())
-        local raceEvents = tonumber(MySQL.scalar.await([[SELECT COUNT(*) FROM
+        local raceEvents = tonumber(DB.value([[SELECT COUNT(*) FROM
             `feather_authority_assignment_events` WHERE `assignment_id`=? AND `request_id` IN (?,?)]],
-            { assignmentId, args[3] .. ':suspend', args[3] .. ':revoke' }))
+            assignmentId, args[3] .. ':suspend', args[3] .. ':revoke'))
         assert(final.ok and final.value.status == 'revoked' and decision.ok
             and decision.value.allowed == false and raceEvents == 1,
             'Concurrent assignment outcome is inconsistent')
@@ -899,14 +902,14 @@ Authority.RegisterDevCommand('AuthorityRoleLiveTest', function(source, args)
         byId.value.label = 'mutated'
         local fresh = AuthorityRoles.Get({ roleId = first.value.roleId }, GetCurrentResourceName())
         assert(fresh.ok and fresh.value.label == request.label, 'Role snapshot was not isolated')
-        local roleCount = tonumber(MySQL.scalar.await(
-            'SELECT COUNT(*) FROM `feather_authority_roles` WHERE `role_key`=?', { roleKey }))
-        local eventCount = tonumber(MySQL.scalar.await([[SELECT COUNT(*) FROM
+        local roleCount = tonumber(DB.value(
+            'SELECT COUNT(*) FROM `feather_authority_roles` WHERE `role_key`=?', roleKey))
+        local eventCount = tonumber(DB.value([[SELECT COUNT(*) FROM
             `feather_authority_role_events` WHERE `role_id`=? AND `event_type`='authority.role.created']],
-            { first.value.roleId }))
-        local receiptCount = tonumber(MySQL.scalar.await([[SELECT COUNT(*) FROM
+            first.value.roleId))
+        local receiptCount = tonumber(DB.value([[SELECT COUNT(*) FROM
             `feather_authority_role_creation_receipts` WHERE `source_resource`=? AND `request_id`=?]],
-            { GetCurrentResourceName(), requestId }))
+            GetCurrentResourceName(), requestId))
         assert(roleCount == 1 and eventCount == 1 and receiptCount == 1,
             'Role creation did not produce exactly one identity, event, and receipt')
         print(('[AuthorityRoleLiveTest] PASS id=%s key=%s firstReplayed=%s replayed=true mismatchRejected=true keyConflict=true singleRoleAudit=true'):format(
@@ -922,10 +925,10 @@ Authority.RegisterDevCommand('AuthorityRoleGrantLiveTest', function(source, args
             and Authority.Uuid(args[2]), 'Use <stable requestId> <role UUID>')
         local role = AuthorityRoles.Get({ roleId = args[2] }, GetCurrentResourceName())
         assert(role.ok, tostring(role.code) .. ': ' .. tostring(role.message))
-        local prior = MySQL.single.await([[SELECT `revision` FROM `feather_authority_role_events`
+        local prior = DB.one([[SELECT `revision` FROM `feather_authority_role_events`
             WHERE `role_id`=? AND `source_resource`=? AND `request_id`=?
                 AND `event_type`='authority.role.grant_added']],
-            { role.value.roleId, GetCurrentResourceName(), args[1] })
+            role.value.roleId, GetCurrentResourceName(), args[1])
         local expectedRevision = prior and tonumber(prior.revision) - 1 or role.value.revision
         local request = { requestId = args[1], roleId = role.value.roleId,
             capabilityKey = 'staff.players.view', expectedRevision = expectedRevision,
@@ -948,10 +951,10 @@ Authority.RegisterDevCommand('AuthorityRoleGrantLiveTest', function(source, args
         classMismatch.expectedRevision = first.value.roleRevision
         local classResult = AuthorityGrants.Issue(classMismatch, GetCurrentResourceName())
         assert(not classResult.ok and classResult.code == 'class_mismatch', 'Cross-class grant was accepted')
-        local grants = tonumber(MySQL.scalar.await([[SELECT COUNT(*) FROM `feather_authority_role_grants`
-            WHERE `role_id`=? AND `status`='active']], { role.value.roleId }))
-        local events = tonumber(MySQL.scalar.await([[SELECT COUNT(*) FROM `feather_authority_role_events`
-            WHERE `role_id`=? AND `event_type`='authority.role.grant_added']], { role.value.roleId }))
+        local grants = tonumber(DB.value([[SELECT COUNT(*) FROM `feather_authority_role_grants`
+            WHERE `role_id`=? AND `status`='active']], role.value.roleId))
+        local events = tonumber(DB.value([[SELECT COUNT(*) FROM `feather_authority_role_events`
+            WHERE `role_id`=? AND `event_type`='authority.role.grant_added']], role.value.roleId))
         assert(grants == 1 and events == 1, 'Grant did not produce exactly one active grant and audit event')
         print(('[AuthorityRoleGrantLiveTest] PASS role=%s grant=%s revision=%d firstReplayed=%s replayed=true mismatchRejected=true staleRejected=true classMismatch=true singleGrantAudit=true'):format(
             role.value.roleId, first.value.grantId, first.value.roleRevision, tostring(first.value.replayed)))

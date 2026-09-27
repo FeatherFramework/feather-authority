@@ -44,14 +44,14 @@ function AuthorityGrants.Issue(request, resource)
     if not valid.ok then return valid end
     request = Authority.Copy(request)
     local result
-    local called, committed = pcall(MySQL.startTransaction, function(query)
+    local called, committed = pcall(DB.transaction, function(tx)
         local executed, outcome = xpcall(function()
-            query([[INSERT IGNORE INTO `feather_authority_role_grant_receipts`
+            tx.exec([[INSERT IGNORE INTO `feather_authority_role_grant_receipts`
                 (`source_resource`,`request_id`,`request_fingerprint`) VALUES (?,?,?)]],
-                { resource, request.requestId, valid.value })
-            local receipts = query([[SELECT `request_fingerprint`,`result_json` FROM
+                resource, request.requestId, valid.value)
+            local receipts = tx.query([[SELECT `request_fingerprint`,`result_json` FROM
                 `feather_authority_role_grant_receipts` WHERE `source_resource`=? AND `request_id`=? FOR UPDATE]],
-                { resource, request.requestId }) or {}
+                resource, request.requestId) or {}
             local receipt = receipts[1]
             if not receipt then return Err('internal_error', 'Grant receipt could not be reserved.') end
             if receipt.request_fingerprint ~= valid.value then
@@ -65,48 +65,48 @@ function AuthorityGrants.Issue(request, resource)
                 value.replayed = true
                 return Ok(value)
             end
-            local roles = query('SELECT * FROM `feather_authority_roles` WHERE `role_id`=? FOR UPDATE',
-                { request.roleId:lower() }) or {}
+            local roles = tx.query('SELECT * FROM `feather_authority_roles` WHERE `role_id`=? FOR UPDATE',
+                request.roleId:lower()) or {}
             local role = roles[1]
             if not role then return Err('role_not_found', 'Authority role was not found.') end
             if role.status ~= 'active' then return Err('role_inactive', 'Authority role is not active.') end
             if tonumber(role.revision) ~= request.expectedRevision then
                 return Err('revision_conflict', 'Authority role revision changed.')
             end
-            local capabilities = query([[SELECT `capability_id`,`capability_key`,`status` FROM
+            local capabilities = tx.query([[SELECT `capability_id`,`capability_key`,`status` FROM
                 `feather_authority_capabilities` WHERE `capability_key`=? FOR UPDATE]],
-                { request.capabilityKey }) or {}
+                request.capabilityKey) or {}
             local capability = capabilities[1]
             if not capability then return Err('capability_not_found', 'Capability was not found.') end
             if capability.status ~= 'active' then return Err('capability_inactive', 'Capability is not active.') end
             if request.capabilityKey:sub(1, #role.role_class + 1) ~= role.role_class .. '.' then
                 return Err('class_mismatch', 'Role and capability namespaces must match.')
             end
-            local ids = query('SELECT UUID() AS `grant_id`,UUID() AS `event_id`') or {}
+            local ids = tx.query('SELECT UUID() AS `grant_id`,UUID() AS `event_id`') or {}
             local grantId, eventId = ids[1] and ids[1].grant_id, ids[1] and ids[1].event_id
-            query([[INSERT IGNORE INTO `feather_authority_role_grants`
+            tx.exec([[INSERT IGNORE INTO `feather_authority_role_grants`
                 (`grant_id`,`role_id`,`capability_id`,`scope_type`) VALUES (?,?,?,?)]],
-                { grantId, request.roleId:lower(), capability.capability_id, request.scopeType })
-            local grants = query([[SELECT `grant_id`,`status`,`revision` FROM `feather_authority_role_grants`
+                grantId, request.roleId:lower(), capability.capability_id, request.scopeType)
+            local grants = tx.query([[SELECT `grant_id`,`status`,`revision` FROM `feather_authority_role_grants`
                 WHERE `role_id`=? AND `capability_id`=? AND `scope_type`=? FOR UPDATE]],
-                { request.roleId:lower(), capability.capability_id, request.scopeType }) or {}
+                request.roleId:lower(), capability.capability_id, request.scopeType) or {}
             if not grants[1] or grants[1].grant_id ~= grantId then
                 return Err('grant_conflict', 'That role grant already exists.')
             end
-            query('UPDATE `feather_authority_roles` SET `revision`=`revision`+1 WHERE `role_id`=?',
-                { request.roleId:lower() })
+            tx.exec('UPDATE `feather_authority_roles` SET `revision`=`revision`+1 WHERE `role_id`=?',
+                request.roleId:lower())
             local value = { grantId = grantId, roleId = request.roleId:lower(),
                 capabilityKey = request.capabilityKey, effect = 'allow', scopeType = request.scopeType,
                 status = 'active', revision = 1, roleRevision = request.expectedRevision + 1, replayed = false }
-            query([[INSERT INTO `feather_authority_role_events`
+            tx.exec([[INSERT INTO `feather_authority_role_events`
                 (`event_id`,`role_id`,`event_type`,`source_resource`,`request_id`,`reason_code`,`revision`)
                 VALUES (?,?,'authority.role.grant_added',?,?,?,?)]],
-                { eventId, request.roleId:lower(), resource, request.requestId,
-                    request.reasonCode, value.roleRevision })
-            query([[UPDATE `feather_authority_role_grant_receipts` SET `result_json`=?
+                eventId, request.roleId:lower(), resource, request.requestId,
+                    request.reasonCode, value.roleRevision)
+            tx.exec([[UPDATE `feather_authority_role_grant_receipts` SET `result_json`=?
                 WHERE `source_resource`=? AND `request_id`=?]],
-                { json.encode(value), resource, request.requestId })
-            query('UPDATE `feather_authority_policy_state` SET `policy_version`=`policy_version`+1 WHERE `id`=1')
+                json.encode(value), resource, request.requestId)
+            tx.exec('UPDATE `feather_authority_policy_state` SET `policy_version`=`policy_version`+1 WHERE `id`=1')
             return Ok(value)
         end, debug.traceback)
         if not executed then result = Err('internal_error', 'Grant transaction failed.'); return false end
@@ -128,10 +128,10 @@ function AuthorityGrants.List(request, resource)
     for field in pairs(request) do
         if field ~= 'roleId' then return Err('invalid_input', 'Unexpected role grant read field.') end
     end
-    local rows = MySQL.query.await([[SELECT g.`grant_id`,g.`role_id`,c.`capability_key`,g.`effect`,
+    local rows = DB.query([[SELECT g.`grant_id`,g.`role_id`,c.`capability_key`,g.`effect`,
         g.`scope_type`,g.`status`,g.`revision` FROM `feather_authority_role_grants` g
         JOIN `feather_authority_capabilities` c ON c.`capability_id`=g.`capability_id`
-        WHERE g.`role_id`=? ORDER BY c.`capability_key` LIMIT 129]], { request.roleId:lower() }) or {}
+        WHERE g.`role_id`=? ORDER BY c.`capability_key` LIMIT 129]], request.roleId:lower()) or {}
     if #rows > 128 then return Err('grant_catalog_limit', 'Role grant catalog exceeds 128 entries.') end
     local result = {}
     for _, row in ipairs(rows) do
